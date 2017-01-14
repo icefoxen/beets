@@ -460,8 +460,9 @@ class Model(object):
         # Perform substitution.
         if isinstance(template, six.string_types):
             template = Template(template)
-        return template.substitute(self.formatted(for_path),
-                                   self._template_funcs())
+        formatted = self.formatted(for_path)
+        tmpl = self._template_funcs()
+        return template.substitute(formatted, tmpl)
 
     # Parsing.
 
@@ -486,67 +487,60 @@ class Results(object):
     """An item query result set. Iterating over the collection lazily
     constructs LibModel objects that reflect database rows.
     """
-    def __init__(self, model_class, rows, db, query=None, sort=None):
-        """Create a result set that will construct objects of type
-        `model_class`.
 
-        `model_class` is a subclass of `LibModel` that will be
-        constructed. `rows` is a query result: a list of mappings. The
-        new objects will be associated with the database `db`.
+    def __init__(self, model_class, db, query, sort):
 
-        If `query` is provided, it is used as a predicate to filter the
-        results for a "slow query" that cannot be evaluated by the
-        database directly. If `sort` is provided, it is used to sort the
-        full list of results before returning. This means it is a "slow
-        sort" and all objects must be built before returning the first
-        one.
-        """
         self.model_class = model_class
-        self.rows = rows
+        self.rows = []
         self.db = db
         self.query = query
         self.sort = sort
 
-        # We keep a queue of rows we haven't yet consumed for
-        # materialization. We preserve the original total number of
-        # rows.
-        self._rows = rows
-        self._row_count = len(rows)
-
-        # The materialized objects corresponding to rows that have been
-        # consumed.
         self._objects = []
+        self._fetch_objects()
 
-    def _get_objects(self):
-        """Construct and generate Model objects for they query. The
-        objects are returned in the order emitted from the database; no
-        slow sort is applied.
+    def _fetch_objects(self):
 
-        For performance, this generator caches materialized objects to
-        avoid constructing them more than once. This way, iterating over
-        a `Results` object a second time should be much faster than the
-        first.
-        """
-        index = 0  # Position in the materialized objects.
-        while index < len(self._objects) or self._rows:
-            # Are there previously-materialized objects to produce?
-            if index < len(self._objects):
-                yield self._objects[index]
-                index += 1
+        where, subvals = self.query.clause()
+        order_by = self.sort.order_clause()
+        sql = ("SELECT * FROM {0}  WHERE {1} {2}").format(
+            self.model_class._table,
+            where or '1',
+            "ORDER BY {0}".format(order_by) if order_by else '',
+        )
 
-            # Otherwise, we consume another row, materialize its object
-            # and produce it.
-            else:
-                while self._rows:
-                    row = self._rows.pop(0)
-                    obj = self._make_model(row)
-                    # If there is a slow-query predicate, ensurer that the
-                    # object passes it.
-                    if not self.query or self.query.match(obj):
-                        self._objects.append(obj)
-                        index += 1
-                        yield obj
-                        break
+        # Get the flexible attributes for the object.
+        # This would be better handled by a single query with an inner
+        # join, but doing that constructively is rather awkward and
+        # I'm not up to the task atm
+        flex_sql = ("SELECT * FROM {0} WHERE {1}").format(
+            self.model_class._flex_table,
+            where or '1',
+            )
+
+
+        with self.db.transaction() as tx:
+            rows = tx.query(sql, subvals)
+            flex_rows = tx.query(flex_sql, subvals)
+
+        flex_items = {}
+        for row in flex_rows:
+            id = row['id']
+            flex_items[id] = row
+
+        for row in rows:
+            flex_values = flex_items.get(row['id'], {})
+
+            cols = dict(row)
+            values = dict((k, v) for (k, v) in cols.items()
+                          if not k[:4] == 'flex')
+
+            # Construct the Python object
+            obj = self.model_class._awaken(self.db, values, flex_values)
+            # If there is a slow-query predicate, ensure that the
+            # object passes it.
+            if not self.query or self.query.match(obj):
+                self._objects.append(obj)
 
     def __iter__(self):
         """Construct and generate Model objects for all matching
@@ -554,49 +548,17 @@ class Results(object):
         """
         if self.sort:
             # Slow sort. Must build the full list first.
-            objects = self.sort.sort(list(self._get_objects()))
+            objects = self.sort.sort(list(self._objects))
             return iter(objects)
 
         else:
             # Objects are pre-sorted (i.e., by the database).
-            return self._get_objects()
-
-    def _make_model(self, row):
-        # Get the flexible attributes for the object.
-        with self.db.transaction() as tx:
-            flex_rows = tx.query(
-                'SELECT * FROM {0} WHERE entity_id=?'.format(
-                    self.model_class._flex_table
-                ),
-                (row['id'],)
-            )
-
-        cols = dict(row)
-        values = dict((k, v) for (k, v) in cols.items()
-                      if not k[:4] == 'flex')
-        flex_values = dict((row['key'], row['value']) for row in flex_rows)
-
-        # Construct the Python object
-        obj = self.model_class._awaken(self.db, values, flex_values)
-        return obj
+            return iter(self._objects)
 
     def __len__(self):
         """Get the number of matching objects.
         """
-        if not self._rows:
-            # Fully materialized. Just count the objects.
-            return len(self._objects)
-
-        elif self.query:
-            # A slow query. Fall back to testing every object.
-            count = 0
-            for obj in self:
-                count += 1
-            return count
-
-        else:
-            # A fast query. Just count the rows.
-            return self._row_count
+        return len(self._objects)
 
     def __nonzero__(self):
         """Does this result contain any objects?
@@ -612,9 +574,8 @@ class Results(object):
         """Get the nth item in this result set. This is inefficient: all
         items up to n are materialized and thrown away.
         """
-        if not self._rows and not self.sort:
-            # Fully materialized and already in order. Just look up the
-            # object.
+        if not self.sort:
+            # Just look up the object.
             return self._objects[n]
 
         it = iter(self)
@@ -673,13 +634,16 @@ class Transaction(object):
         """Execute an SQL statement with substitution values and return
         a list of rows from the database.
         """
+        #print("Executing query: {}, {}".format(statement, subvals))
         cursor = self.db._connection().execute(statement, subvals)
         return cursor.fetchall()
+        #return self.db._query(statement, subvals)
 
     def mutate(self, statement, subvals=()):
         """Execute an SQL statement with substitution values and return
         the row ID of the last affected row.
         """
+        #print("Executing mutate: {}, {}".format(statement, subvals))
         cursor = self.db._connection().execute(statement, subvals)
         return cursor.lastrowid
 
@@ -693,6 +657,7 @@ class Database(object):
     the backend.
     """
     _models = ()
+    _model_cache = {}
     """The Model subclasses representing tables in this database.
     """
 
@@ -833,26 +798,22 @@ class Database(object):
         """
         query = query or TrueQuery()  # A null query.
         sort = sort or NullSort()  # Unsorted.
-        where, subvals = query.clause()
-        order_by = sort.order_clause()
-
-        sql = ("SELECT * FROM {0} WHERE {1} {2}").format(
-            model_cls._table,
-            where or '1',
-            "ORDER BY {0}".format(order_by) if order_by else '',
-        )
-
-        with self.transaction() as tx:
-            rows = tx.query(sql, subvals)
-
-        return Results(
-            model_cls, rows, self,
-            None if where else query,  # Slow query component.
-            sort if sort.is_slow() else None,  # Slow sort component.
-        )
+        return Results(model_cls, self, query, sort)
 
     def _get(self, model_cls, id):
         """Get a Model object by its id or None if the id does not
         exist.
         """
-        return self._fetch(model_cls, MatchQuery('id', id)).get()
+        # This caching is pretty weaksauce but does seem to lead to
+        # a performance improvement.  However, we currently have no
+        # way for the database to know when one of these models
+        # has been altered, and so it is unsafe; if we figure out
+        # a way to invalidate a cache entry on write, uncomment the
+        # line that actually adds a model to a the cache.
+        key = (model_cls, id)
+        if key in self._model_cache:
+            self._model_cache[key]
+        else:
+            model = self._fetch(model_cls, MatchQuery('id', id)).get()
+            #self._model_cache[key] = model
+            return model
